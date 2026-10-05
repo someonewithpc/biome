@@ -4,7 +4,9 @@
 //! incoming state of each occurrence. Only unwritten bindings declared in the
 //! same execution root participate, so refinements cannot cross closure boundaries.
 
-use super::{ImportResolution, ResolutionCtx, resolve_local_type_on_demand};
+use super::{
+    ImportResolution, ResolutionCtx, flow_guards::CallAssertion, resolve_local_type_on_demand,
+};
 use crate::db::queries::{
     BindingTypeInput, FlowBindingTypeInput, FlowRootInput, infer_flow_binding_type,
     narrowing_flow_for_root,
@@ -15,8 +17,8 @@ use biome_js_control_flow::{
 };
 use biome_js_semantic::{Binding, JsDeclarationKind};
 use biome_js_syntax::{
-    AnyJsExpression, AnyJsLiteralExpression, JsBinaryOperator, JsLogicalOperator, JsSyntaxNode,
-    JsUnaryOperator,
+    AnyJsExpression, AnyJsLiteralExpression, JsBinaryOperator, JsCallExpression, JsLogicalOperator,
+    JsSyntaxNode, JsUnaryOperator,
 };
 use biome_js_type_info::interned_types::TypeData;
 use biome_js_type_info::{NarrowingPredicate, TypeofKind, narrow_type};
@@ -152,22 +154,27 @@ impl<'db> ResolutionCtx<'db, '_> {
                     pending.push(*antecedent);
                     if !relevant && let Some(condition) = expression_at(root.syntax(), *expression)
                     {
-                        relevant = condition
-                            .syntax()
-                            .descendants()
-                            .take(MAX_FLOW_TYPE_STEPS)
-                            .any(|node| {
-                                let Some(AnyJsExpression::JsIdentifierExpression(identifier)) =
-                                    AnyJsExpression::cast(node)
-                                else {
-                                    return false;
-                                };
-                                identifier
-                                    .name()
-                                    .ok()
-                                    .and_then(|name| self.js_info.semantic_model.binding(&name))
-                                    .is_some_and(|candidate| candidate == *binding)
-                            });
+                        relevant = self.condition_mentions_binding(&condition, binding);
+                    }
+                }
+                FlowNode::CallContinuation {
+                    antecedent,
+                    expression,
+                } => {
+                    pending.push(*antecedent);
+                    if !relevant
+                        && let Some(AnyJsExpression::JsCallExpression(call)) =
+                            expression_at(root.syntax(), *expression)
+                        && let Some(assertion) = self.call_assertion(&call)
+                    {
+                        relevant = match assertion {
+                            CallAssertion::Truthy(argument) => {
+                                self.condition_mentions_binding(&argument, binding)
+                            }
+                            CallAssertion::Type { argument, .. } => {
+                                self.is_binding_read(&argument, binding)
+                            }
+                        };
                     }
                 }
             }
@@ -253,7 +260,10 @@ impl<'db> ResolutionCtx<'db, '_> {
                         successors[*predecessor].push(index);
                     }
                 }
-                FlowNode::Condition { antecedent, .. } => successors[*antecedent].push(index),
+                FlowNode::Condition { antecedent, .. }
+                | FlowNode::CallContinuation { antecedent, .. } => {
+                    successors[*antecedent].push(index)
+                }
             }
         }
         let mut states = vec![TypeData::NeverKeyword; graph.nodes.len()];
@@ -295,6 +305,21 @@ impl<'db> ResolutionCtx<'db, '_> {
                         incoming
                     }
                 }
+                FlowNode::CallContinuation {
+                    antecedent,
+                    expression,
+                } => {
+                    let incoming = states[*antecedent];
+                    if incoming == TypeData::NeverKeyword {
+                        incoming
+                    } else if let Some(AnyJsExpression::JsCallExpression(call)) =
+                        expression_at(root, *expression)
+                    {
+                        self.narrow_assertion(binding, incoming, &call, &mut remaining)
+                    } else {
+                        incoming
+                    }
+                }
             };
             if states[index] != ty {
                 states[index] = ty;
@@ -307,6 +332,46 @@ impl<'db> ResolutionCtx<'db, '_> {
             }
         }
         states[point]
+    }
+
+    fn condition_mentions_binding(&self, expression: &AnyJsExpression, binding: &Binding) -> bool {
+        expression
+            .syntax()
+            .descendants()
+            .take(MAX_FLOW_TYPE_STEPS)
+            .any(|node| {
+                let Some(AnyJsExpression::JsIdentifierExpression(identifier)) =
+                    AnyJsExpression::cast(node)
+                else {
+                    return false;
+                };
+                identifier
+                    .name()
+                    .ok()
+                    .and_then(|name| self.js_info.semantic_model.binding(&name))
+                    .is_some_and(|candidate| candidate == *binding)
+            })
+    }
+
+    fn narrow_assertion(
+        &mut self,
+        binding: &Binding,
+        ty: TypeData<'db>,
+        call: &JsCallExpression,
+        remaining: &mut usize,
+    ) -> TypeData<'db> {
+        match self.call_assertion(call) {
+            Some(CallAssertion::Truthy(argument)) => {
+                self.narrow_condition(binding, ty, argument, FlowOutcome::Truthy, 0, remaining)
+            }
+            Some(CallAssertion::Type {
+                argument,
+                predicate,
+            }) if self.is_binding_read(&argument, binding) => {
+                narrow_type(self.db, ty, predicate, true)
+            }
+            Some(CallAssertion::Type { .. }) | None => ty,
+        }
     }
 
     #[expect(

@@ -9,10 +9,11 @@ use crate::JsModuleInfo;
 use biome_js_control_flow::AnyJsControlFlowRoot;
 use biome_js_semantic::JsDeclarationKind;
 use biome_js_syntax::{
-    AnyJsExpression, AnyJsRoot, AnyTsType, JsConditionalExpression, JsDoWhileStatement,
-    JsForStatement, JsIdentifierExpression, JsIfStatement, JsLogicalExpression, JsSyntaxKind,
-    JsWhileStatement,
+    AnyJsExpression, AnyJsRoot, AnyTsType, JsCallExpression, JsConditionalExpression,
+    JsDoWhileStatement, JsForStatement, JsIdentifierExpression, JsIfStatement, JsLogicalExpression,
+    JsSyntaxKind, JsWhileStatement,
 };
+use biome_js_type_info::{RawTypeData, RawTypeId, ReturnType, TypeReference};
 use biome_rowan::{AstNode, SyntaxKind, TextRange, WalkEvent, declare_node_union};
 use rustc_hash::FxHashSet;
 
@@ -53,11 +54,14 @@ declare_node_union! {
         | JsForStatement
         | JsLogicalExpression
         | JsConditionalExpression
+        | JsCallExpression
 }
 
 fn collect_candidates(info: &JsModuleInfo) -> Option<FxHashSet<TextRange>> {
     let mut remaining = MAX_INDEX_STEPS;
-    let conditions = condition_ranges(&info.semantic_model.root(), &mut remaining)?;
+    let conditions = condition_ranges(&info.semantic_model.root(), &mut remaining, |call| {
+        assertion_condition(info, call)
+    })?;
     let mut candidates = FxHashSet::default();
     if conditions.is_empty() {
         return Some(candidates);
@@ -127,12 +131,36 @@ fn collect_candidates(info: &JsModuleInfo) -> Option<FxHashSet<TextRange>> {
     Some(candidates)
 }
 
+fn assertion_condition(info: &JsModuleInfo, call: JsCallExpression) -> Option<AnyJsExpression> {
+    let AnyJsExpression::JsIdentifierExpression(callee) = call.callee().ok()?.omit_parentheses()
+    else {
+        return None;
+    };
+    let binding = info.semantic_model.binding(&callee.name().ok()?)?;
+    if binding.is_imported() || binding.declaration_kind() != JsDeclarationKind::Function {
+        return None;
+    }
+    let TypeReference::Resolved(RawTypeId::Local(id)) =
+        info.raw_binding_types.get(&binding.range())?
+    else {
+        return None;
+    };
+    let RawTypeData::Function(function) = info.raw_types.get(id.index())? else {
+        return None;
+    };
+    matches!(function.return_type, ReturnType::Asserts(_)).then_some(call.into())
+}
+
 /// Collects condition subtrees and roots whose flow walk may exceed its budget.
 ///
 /// Source order does not restrict candidates: a later loop condition can affect
 /// an earlier read through a backedge. Overlapping ranges are merged only for
 /// reference membership checks, not to represent control-flow relationships.
-fn condition_ranges(root: &AnyJsRoot, remaining: &mut usize) -> Option<Vec<TextRange>> {
+fn condition_ranges(
+    root: &AnyJsRoot,
+    remaining: &mut usize,
+    mut assertion_condition: impl FnMut(JsCallExpression) -> Option<AnyJsExpression>,
+) -> Option<Vec<TextRange>> {
     let mut ranges = Vec::new();
     let mut root_constructs = Vec::<usize>::new();
     let mut traversal = root.syntax().preorder();
@@ -189,6 +217,7 @@ fn condition_ranges(root: &AnyJsRoot, remaining: &mut usize) -> Option<Vec<TextR
                         FlowConditionSource::JsConditionalExpression(expression) => {
                             Some(expression.test().ok()?)
                         }
+                        FlowConditionSource::JsCallExpression(call) => assertion_condition(call),
                     };
                     if let Some(condition) = condition {
                         ranges.push(condition.range());
@@ -232,7 +261,7 @@ mod tests {
             ("function f(x) { if () x; }", MAX_INDEX_STEPS),
         ] {
             let root = parse(source, JsFileSource::ts(), JsParserOptions::default()).tree();
-            assert!(condition_ranges(&root, &mut remaining).is_none());
+            assert!(condition_ranges(&root, &mut remaining, |_| None).is_none());
             let candidates = FlowCandidates { expressions: None };
             assert!(candidates.contains(root.range()));
         }
@@ -253,7 +282,7 @@ mod tests {
         assert!(!parsed.has_errors());
         let mut remaining = 100;
         assert_eq!(
-            condition_ranges(&parsed.tree(), &mut remaining),
+            condition_ranges(&parsed.tree(), &mut remaining, |_| None),
             Some(Vec::new())
         );
     }
@@ -265,7 +294,7 @@ mod tests {
             let parsed = parse(&source, JsFileSource::ts(), JsParserOptions::default());
             assert!(!parsed.has_errors());
             let mut remaining = MAX_INDEX_STEPS;
-            let ranges = condition_ranges(&parsed.tree(), &mut remaining).unwrap();
+            let ranges = condition_ranges(&parsed.tree(), &mut remaining, |_| None).unwrap();
             assert_eq!(ranges.is_empty(), count == MAX_FLOW_CONSTRUCTS);
         }
     }
