@@ -339,6 +339,11 @@ impl<'db> ResolutionCtx<'db, '_> {
             return ty;
         }
         match expression {
+            AnyJsExpression::JsCallExpression(call) => {
+                self.call_predicate(&call, binding).map_or(ty, |predicate| {
+                    narrow_type(self.db, ty, predicate, positive)
+                })
+            }
             AnyJsExpression::JsUnaryExpression(unary)
                 if unary.operator().ok() == Some(JsUnaryOperator::LogicalNot) =>
             {
@@ -415,7 +420,7 @@ impl<'db> ResolutionCtx<'db, '_> {
         }
     }
 
-    fn is_binding_read(&self, expression: &AnyJsExpression, binding: &Binding) -> bool {
+    pub(super) fn is_binding_read(&self, expression: &AnyJsExpression, binding: &Binding) -> bool {
         let AnyJsExpression::JsIdentifierExpression(identifier) =
             expression.clone().omit_parentheses()
         else {

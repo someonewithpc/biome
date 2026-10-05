@@ -13,6 +13,7 @@ mod expressions;
 mod flow;
 mod flow_candidates;
 mod flow_expressions;
+mod flow_guards;
 mod globals;
 mod imports;
 mod lookup;
