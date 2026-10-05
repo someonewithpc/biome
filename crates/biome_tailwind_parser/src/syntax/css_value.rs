@@ -353,15 +353,27 @@ fn parse_unary_expression(p: &mut TailwindParser) -> ParsedSyntax {
 
     let m = p.start();
     p.eat_ts_with_context(UNARY_OPERATION_TOKEN, TailwindLexContext::CssValue);
-    parse_unary_expression_operand(p)
-        .or_add_diagnostic(p, crate::syntax::parse_error::expected_value);
+    parse_css_value(p).or_add_diagnostic(p, crate::syntax::parse_error::expected_value);
     Present(m.complete(p, CSS_UNARY_EXPRESSION))
 }
 
 #[inline]
 fn parse_unary_expression_operand(p: &mut TailwindParser) -> ParsedSyntax {
     if is_at_unary_operator(p) {
-        parse_unary_expression(p)
+        match parse_unary_expression(p) {
+            // `rgb(+1_2_3)`: the unary is the first of several space-separated values.
+            Present(unary) if is_at_any_value(p) => {
+                let list = ComponentValueExpressionList {
+                    leading_value: Some(unary),
+                }
+                .parse_list(p);
+                Present(
+                    list.precede(p)
+                        .complete(p, CSS_LIST_OF_COMPONENT_VALUES_EXPRESSION),
+                )
+            }
+            unary => unary,
+        }
     } else if p.at(T!['(']) {
         parse_parenthesized_expression(p)
     } else {
@@ -388,16 +400,27 @@ fn parse_list_of_component_values_expression(p: &mut TailwindParser) -> ParsedSy
     }
 
     let m = p.start();
-    ComponentValueExpressionList.parse_list(p);
+    ComponentValueExpressionList::default().parse_list(p);
     Present(m.complete(p, CSS_LIST_OF_COMPONENT_VALUES_EXPRESSION))
 }
 
-struct ComponentValueExpressionList;
+#[derive(Default)]
+struct ComponentValueExpressionList {
+    /// A value the caller already parsed that becomes the first list element.
+    leading_value: Option<CompletedMarker>,
+}
 
 impl ParseNodeList for ComponentValueExpressionList {
     type Kind = TailwindSyntaxKind;
     type Parser<'source> = TailwindParser<'source>;
     const LIST_KIND: Self::Kind = CSS_COMPONENT_VALUE_LIST;
+
+    fn start_list(&mut self, p: &mut Self::Parser<'_>) -> Marker {
+        match self.leading_value.take() {
+            Some(value) => value.precede(p),
+            None => p.start(),
+        }
+    }
 
     fn parse_element(&mut self, p: &mut Self::Parser<'_>) -> ParsedSyntax {
         parse_css_value(p)
